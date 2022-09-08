@@ -48,12 +48,11 @@ public class ListAnimatedImage implements AnimatedImage {
      * Update the pixels in the given array with that frame. Not thread safe.
      * 
      * @param frame
-     * @param pixels
      * @throws Exception 
      */
     @Override
-    public void getFrame(int frame, int[] pixels) throws Exception {
-        frames.get(frame).getImage(pixels);
+    public int[] getFrame(int frame) throws Exception {
+        return frames.get(frame).getImage();
     }
 
     @Override

@@ -2,44 +2,58 @@
 package chatty.util.gif;
 
 import chatty.util.ElapsedTime;
+
 import java.awt.Dimension;
 import java.awt.image.ColorModel;
 import java.awt.image.ImageConsumer;
 import java.awt.image.ImageProducer;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.Set;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
+
 
 /**
  * An ImageProducer for animated images.
- * 
+ *
  * @author tduva
  */
 public class AnimatedImageSource implements ImageProducer {
-    
+
     private static final Logger LOGGER = Logger.getLogger(AnimatedImageSource.class.getName());
-    
+
     private static final int INACTIVITY_SECONDS = 5;
-    
+
     private final Set<ImageConsumer> consumers = new HashSet<>();
 
     private final AnimatedImage image;
     private final int width;
     private final int height;
     private final ColorModel colorModel;
-    
+    private final static ScheduledThreadPoolExecutor timer =
+            new ScheduledThreadPoolExecutor(Runtime.getRuntime().availableProcessors());
+
     private int[] pixels;
     private int currentFrame = -1;
-    private Thread thread;
+    private ScheduledFuture<?> produceFrames;
     private ElapsedTime noConsumersTime;
     private boolean errorOccured;
-    
+
     public AnimatedImageSource(AnimatedImage image) {
         this.image = image;
         Dimension size = image.getSize();
         width = size.width;
         height = size.height;
         colorModel = ColorModel.getRGBdefault();
+//        timer = new Timer("AnimatedImage" + (image.getName() != null ?
+//                                             "-" + image.getName() : ""));
     }
 
     //==========================
@@ -49,7 +63,7 @@ public class AnimatedImageSource implements ImageProducer {
     public void startProduction(ImageConsumer ic) {
         addConsumer(ic);
     }
-    
+
     @Override
     public synchronized void addConsumer(ImageConsumer ic) {
         if (isConsumer(ic)) {
@@ -60,40 +74,68 @@ public class AnimatedImageSource implements ImageProducer {
         sendFrame(ic);
         startThread();
     }
-    
+
     @Override
     public synchronized void removeConsumer(ImageConsumer ic) {
         consumers.remove(ic);
     }
-    
+
     @Override
     public synchronized boolean isConsumer(ImageConsumer ic) {
         return consumers.contains(ic);
     }
-    
+
     @Override
     public void requestTopDownLeftRightResend(ImageConsumer ic) {
         // Empty
     }
-    
+
     //==========================
     // Frame updates
     //==========================
-    
-    public static volatile int ANIMATION_PAUSE = -1;
-    
+
+    private static volatile int ANIMATION_PAUSE = -1;
+    private static volatile Set<AnimatedImageSource> paused =
+            Collections.synchronizedSet(Collections.newSetFromMap(
+                    new IdentityHashMap<>()));
+
+    public static void setAnimationPause(int animationPause) {
+        synchronized (paused) {
+            ANIMATION_PAUSE = animationPause;
+            if (ANIMATION_PAUSE == -1) {
+                paused.forEach(AnimatedImageSource::startThread);
+                paused.clear();
+            }
+        }
+    }
+
     private void startThread() {
         if (errorOccured) {
             return;
         }
-        if (thread == null || !thread.isAlive()) {
-            thread = new Thread(() -> {
-                do {
+        if (produceFrames == null) {
+            class ProduceFrames implements Runnable {
+
+                @Override
+                public void run() {
                     if (isActive()) {
                         nextFrame();
-                    }
-                    else {
-                        // Animation is paused, switch frame if necessary
+                        // Schedule another frame for production only if production shouldn't be
+                        // stopped.
+                        if (!checkStopThread()) {
+                            produceFrames = timer.schedule(new ProduceFrames(), getDelay(),
+                                                           TimeUnit.MILLISECONDS);
+                        } else {
+                            produceFrames = null;
+                            pixels = null;
+                        }
+                    } else {
+                        // Add this source to the paused sources so on change a restart is triggered
+                        // and we don't have check periodically.
+                        paused.add(AnimatedImageSource.this);
+                        // There is no update necessary until ANIMATION_PAUSE is updated.
+                        produceFrames = null;
+                        // Animation is paused, switch frame if necessary.
                         int pauseFrame = 0;
                         switch (ANIMATION_PAUSE) {
                             case 0:
@@ -106,48 +148,35 @@ public class AnimatedImageSource implements ImageProducer {
                                 pauseFrame = image.getPreferredPauseFrame();
                                 break;
                         }
-                        
+
                         if (pauseFrame != currentFrame || !hasPixels()) {
                             currentFrame = pauseFrame - 1;
                             nextFrame();
                         }
                     }
-                    try {
-                        Thread.sleep(getDelay());
-                    }
-                    catch (InterruptedException ex) {
-                        // Do nothing
-                    }
-                    if (checkStopThread() || Thread.interrupted()) {
-                        threadStopped();
-                        return;
-                    }
-                } while (true);
-            }, "AnimatedImage"+(image.getName() != null ? "-"+image.getName() : ""));
-            thread.setDaemon(true);
-            // ImageFetcher is setting a lower priority, so may make sense?
-            thread.setPriority(2);
-            thread.start();
+                }
+
+            }
+            produceFrames = timer.schedule(new ProduceFrames(), 0, TimeUnit.MILLISECONDS);
         }
     }
-    
+
     private synchronized int getDelay() {
         return image.getDelay(currentFrame);
     }
-    
+
     private synchronized boolean isActive() {
         return ANIMATION_PAUSE == -1;
     }
-    
+
     private synchronized boolean hasPixels() {
         return pixels != null;
     }
-    
+
     /**
-     * Check if enough time has passed with no consumers registered for the
-     * thread to stop.
-     * 
-     * @return 
+     * Check if enough time has passed with no consumers registered for the thread to stop.
+     *
+     * @return
      */
     private synchronized boolean checkStopThread() {
         if (errorOccured) {
@@ -162,45 +191,36 @@ public class AnimatedImageSource implements ImageProducer {
         }
         return noConsumersTime.secondsElapsed(INACTIVITY_SECONDS);
     }
-    
-    private synchronized void threadStopped() {
-        thread = null;
-        pixels = null;
-    }
-    
+
     /**
      * Load the next frame and send to all consumers.
      */
     private synchronized void nextFrame() {
         // Load new current frame
         currentFrame = (currentFrame + 1) % image.getFrameCount();
-        if (pixels == null) {
-            pixels = new int[width * height];
-        }
         try {
-            image.getFrame(currentFrame, pixels);
-        }
-        catch (Exception ex) {
+            pixels = image.getFrame(currentFrame);
+        } catch (Exception ex) {
             /**
              * This usually shouldn't happen, since the image at this point
              * would already have been parsed and now just the cached frames
              * being retrieved, but just in case.
              */
             LOGGER.warning(String.format("Error getting %s frame: %s",
-                    image.getName(), ex));
+                                         image.getName(), ex));
             errorOccured = true;
         }
-        
+
         // Send current frame to all
         for (ImageConsumer ic : consumers) {
             sendFrame(ic);
         }
     }
-    
+
     /**
      * Send the currently loaded frame (if any) to the given consumer.
-     * 
-     * @param ic 
+     *
+     * @param ic
      */
     private void sendFrame(ImageConsumer ic) {
         if (pixels == null) {
@@ -218,17 +238,16 @@ public class AnimatedImageSource implements ImageProducer {
                  * eventually cause the thread to stop.
                  */
                 ic.imageComplete(ImageConsumer.STATICIMAGEDONE);
-            }
-            else {
+            } else {
                 ic.imageComplete(ImageConsumer.SINGLEFRAMEDONE);
             }
         }
     }
-    
+
     //==========================
     // Other
     //==========================
-    
+
     private void initConsumer(ImageConsumer ic) {
         if (isConsumer(ic)) {
             ic.setDimensions(width, height);
@@ -239,17 +258,16 @@ public class AnimatedImageSource implements ImageProducer {
         if (isConsumer(ic)) {
             if (image.getFrameCount() == 1) {
                 ic.setHints(
-                          ImageConsumer.TOPDOWNLEFTRIGHT
+                        ImageConsumer.TOPDOWNLEFTRIGHT
                         | ImageConsumer.COMPLETESCANLINES
                         | ImageConsumer.SINGLEPASS
                         | ImageConsumer.SINGLEFRAME);
-            }
-            else {
+            } else {
                 ic.setHints(
-                          ImageConsumer.TOPDOWNLEFTRIGHT
+                        ImageConsumer.TOPDOWNLEFTRIGHT
                         | ImageConsumer.COMPLETESCANLINES);
             }
         }
     }
-    
+
 }

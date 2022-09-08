@@ -11,7 +11,7 @@ import java.awt.Dimension;
  */
 public interface AnimatedImage {
 
-    public void getFrame(int frame, int[] pixels) throws Exception;
+    public int[] getFrame(int frame) throws Exception;
     public int getFrameCount();
     public int getDelay(int frame);
     public Dimension getSize();
@@ -19,7 +19,7 @@ public interface AnimatedImage {
     public int getPreferredPauseFrame();
     
     public static void setAnimationPause(int state) {
-        AnimatedImageSource.ANIMATION_PAUSE = state;
+        AnimatedImageSource.setAnimationPause(state);
     }
     
 }
